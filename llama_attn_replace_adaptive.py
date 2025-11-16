@@ -57,12 +57,12 @@ class AdaptiveS2AttnPredictor(nn.Module):
     def _init_weights(self):
         """Initialize to produce default S²-Attn behavior initially"""
         # Initialize group predictor to output ~0.25 (1/4 ratio)
-        nn.init.constant_(self.group_predictor[-1].bias, 0.0)
-        nn.init.constant_(self.group_predictor[-1].weight, 0.0)
+        nn.init.constant_(self.group_predictor[-2].bias, 0.0)
+        nn.init.constant_(self.group_predictor[-2].weight, 0.0)
 
         # Initialize shift predictor to output ~0.5 (half group shift)
-        nn.init.constant_(self.shift_predictor[-1].bias, 0.0)
-        nn.init.constant_(self.shift_predictor[-1].weight, 0.0)
+        nn.init.constant_(self.shift_predictor[-2].bias, 0.0)
+        nn.init.constant_(self.shift_predictor[-2].weight, 0.0)
 
     def forward(self, hidden_states, q_len):
         """
@@ -498,7 +498,9 @@ def add_adaptive_predictor_to_model(model, hidden_size=None, num_heads=None):
 
     # Add predictor to each attention layer
     for name, module in model.named_modules():
-        if 'self_attn' in name or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+        # --- THIS IS THE FIX ---
+        # The 'self_attn' in name check was causing the RecursionError
+        if isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
             module.adaptive_predictor = AdaptiveS2AttnPredictor(hidden_size, num_heads)
             print(f"Added adaptive predictor to {name}")
 
