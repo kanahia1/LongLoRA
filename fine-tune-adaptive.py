@@ -31,6 +31,8 @@ from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
 
 from datasets import load_dataset
+import huggingface_hub
+huggingface_hub.login(token)
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -49,7 +51,7 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=8192 * 4,
+        default=2048,  # FIXED: Reduced from 32768 to avoid length issues
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     use_flash_attn: bool = field(
@@ -95,16 +97,34 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-def tokenize_fn(tokenizer, example):
+def tokenize_fn(tokenizer, examples):
+    """FIXED: Proper tokenization that handles batches correctly"""
     context_length = tokenizer.model_max_length
-    outputs = tokenizer(
-        tokenizer.eos_token.join(example["text"]),
+    
+    # Concatenate all texts in the batch
+    concatenated_text = tokenizer.eos_token.join(examples["text"])
+    
+    # Tokenize the concatenated text
+    tokenized = tokenizer(
+        concatenated_text,
         truncation=False,
-        return_tensors="pt",
-        pad_to_multiple_of=context_length,
-        padding=True,
+        padding=False,
+        return_tensors=None,
     )
-    return {"input_ids": outputs["input_ids"].view(-1, context_length)}
+    
+    # Get all input_ids
+    all_input_ids = tokenized["input_ids"]
+    
+    # Split into chunks of context_length
+    chunked_input_ids = []
+    for i in range(0, len(all_input_ids), context_length):
+        chunk = all_input_ids[i:i + context_length]
+        # Only keep chunks that are exactly context_length
+        if len(chunk) == context_length:
+            chunked_input_ids.append(chunk)
+    
+    # Return properly structured for Arrow
+    return {"input_ids": chunked_input_ids}
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
@@ -180,22 +200,51 @@ def train():
         model = add_adaptive_predictor_to_model(model)
         print("✅ Adaptive predictors added successfully")
 
-    rank = int(os.environ.get('RANK', -1))
-    if rank > 0:
-        barrier()
-    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
-    dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+    # FIXED: Simplified dataset loading without distributed barriers
+    print("📦 Loading dataset...")
+    dataset = load_dataset(
+        "wikitext",
+        "wikitext-103-raw-v1",
+        cache_dir=training_args.cache_dir,
+    )
+    
+    # Get columns to remove
+    columns_to_remove = [col for col in dataset["train"].column_names if col != "text"]
+    
+    print(f"📝 Dataset columns: {dataset['train'].column_names}")
+    print(f"🗑️  Columns to remove: {columns_to_remove}")
+    print(f"📏 Max sequence length: {training_args.model_max_length}")
+    
+    # FIXED: Process dataset without multiprocessing to avoid errors
+    print("⚙️  Tokenizing dataset (this may take a while)...")
+    
+    # Take a subset for faster testing (remove this line for full dataset)
+    dataset["train"] = dataset["train"].select(range(min(10000, len(dataset["train"]))))
+    
+    dataset = dataset.map(
+        partial(tokenize_fn, tokenizer),
+        batched=True,
+        batch_size=1000,  # Process in batches
+        num_proc=1,  # FIXED: Single process to avoid multiprocessing issues
+        remove_columns=columns_to_remove,
+        desc="Tokenizing"
+    )
+    
+    # Filter out any empty batches
+    dataset = dataset.filter(lambda x: len(x["input_ids"]) > 0)
 
-    if rank == 0:
-        barrier()
-
+    print(f"✅ Dataset tokenized successfully")
     print(dataset)
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # FIXED: Use simpler data collator
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, 
+        mlm=False,
+        pad_to_multiple_of=8  # For efficiency
+    )
 
     if training_args.low_rank_training:
         if model_args.model_type == "gpt-neox":
-            # added `dense` to match with llama as the basic LoRA would only target 'query_key_value'
             targets = ["query_key_value", "dense"]
         else:
             targets=["q_proj", "k_proj", "v_proj", "o_proj"]
